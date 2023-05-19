@@ -1,0 +1,103 @@
+---
+title: "k_anom_sql"
+output: html_document
+---
+
+# Environment
+
+```{r}
+library(dplyr)
+```
+
+# Load ICDs
+
+```{r}
+unique_icd <- read_csv("unique_icd.csv")
+```
+
+```{r}
+# Generate random values based on the structure and demog_comp_phi dataset
+hosp_stay_id <- sample(10000:50000, 12300, replace = TRUE)
+hosp_mortality_bin <- sample(0:1, 12300, replace = TRUE)
+sex <- sample(1:2, 12300, replace = TRUE)
+icd <- sample(unique_icd$x, 12300, replace = TRUE)
+age <- sample(18:90, 12300, replace = TRUE)
+
+# Create the dataset
+demog_comp_phi <- data.frame(hosp_stay_id, hosp_mortality_bin, sex, icd, age)
+
+# Display the dataset
+head(demog_comp_phi)
+
+demog_comp_phi<-unique(demog_comp_phi)
+```
+
+# Creating artificial dataset
+
+## demog_phi
+
+```{r}
+# Set the random seed for reproducibility
+set.seed(123)
+
+# Generate random values for the dataset
+num_patients <- 13000
+patient_id <- sample(10000000:99999999, num_patients, replace = FALSE)
+birth_date <- sample(seq(as.Date("1920/01/01"), as.Date("2005/12/31"), by = "day"), num_patients, replace = TRUE)
+sex <- sample(1:2, num_patients, replace = TRUE)
+nation_ref <- c(rep("ES", round(0.9 * num_patients)), sample(setdiff(c("IN", "CO", "GB", "US", "JP"), "ES"), round(0.1 * num_patients), replace = TRUE))
+
+# Create the dataset
+demog_phi <- tibble(patient_id, birth_date, sex, nation_ref)
+
+```
+
+## stay_events_phi
+
+```{r}
+# Load the required package
+library(dplyr)
+library(lubridate)
+
+# Set the random seed for reproducibility
+set.seed(123)
+
+# Generate random values for the dataset
+num_records <- 30000
+patient_id <- sample(1000:9999, num_records, replace = TRUE)
+hosp_stay_id <- sample(100000000:999999999, num_records, replace = FALSE)
+stay_id <- sample(100000:999999, num_records, replace = FALSE)
+stay_type <- sample(c("SALA", "ICU"), num_records, replace = TRUE)
+hosp_adm_date <- sample(seq(as.POSIXct("2021-01-01"), as.POSIXct("2022-12-31"), by = "day"), num_records, replace = TRUE)
+hosp_disch_date <- hosp_adm_date + sample(1:14, num_records, replace = TRUE) # Adding random hospital stay duration of up to 14 days
+hosp_stay_seq_num <- sample(1:3, num_records, replace = TRUE)
+to_icu <- sample(0:1, num_records, replace = TRUE)
+icu_los <- ifelse(to_icu == 1, sample(1:5, num_records, replace = TRUE), NA)
+hosp_los <- as.numeric(difftime(hosp_disch_date, hosp_adm_date, units = "days"))
+hosp_mortality_bin <- sample(0:1, num_records, replace = TRUE)
+hosp_mortality_date <- ifelse(hosp_mortality_bin == 1, sample(seq(as.Date("2021-01-01"), as.Date("2021-12-31"), by = "day"), num_records, replace = TRUE), NA)
+
+# Create the dataset
+stay_events_phi <- tibble(patient_id, hosp_stay_id, stay_id, stay_type, hosp_adm_date, hosp_disch_date, hosp_stay_seq_num, to_icu, icu_los, hosp_los, hosp_mortality_bin, hosp_mortality_date)
+
+```
+
+## diag_events_phi
+
+```{r}
+# Set the random seed for reproducibility
+set.seed(123)
+
+# Generate random values for the dataset
+num_records <- 12300
+patient_id <- sample(1000:9999, num_records, replace = TRUE)
+hosp_stay_id <- sample(1000000000:9999999999, num_records, replace = FALSE)
+icd <- sample(unique_icd$x, num_records, replace = TRUE)
+diag_type <- sample(c("S", "P"), num_records, replace = TRUE)
+reg_date <- sample(seq(as.Date("2018-01-01"), as.Date("2023-01-01"), by = "day"), num_records, replace = TRUE)
+
+# Create the dataset
+diag_events_phi <- tibble(patient_id, hosp_stay_id, icd, diag_type, reg_date)
+
+```
+

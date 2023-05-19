@@ -1,0 +1,549 @@
+---
+title: "k_anom_sql"
+output: html_document
+---
+
+# Environment
+
+```{r}
+library(RPostgreSQL)
+library(ssh)
+library(tidyverse)
+library(data.table)
+library(purrr)
+library(lubridate)
+library(magrittr)
+```
+
+
+
+# Extracting data from p_zero_phi
+
+```{r}
+# Execute the query
+demog_phi <- dbGetQuery(pg_con, "SELECT * FROM p_zero_phi.demog_phi")
+# deid_keys <- dbGetQuery(pg_con, "SELECT * FROM p_zero_phi.deid_keys")
+stay_events_phi <- dbGetQuery(pg_con, "SELECT * FROM p_zero_phi.stay_events_phi")
+diag_events_phi <- dbGetQuery(pg_con, "SELECT * FROM p_zero_phi.diag_events_phi")
+```
+
+# Creating k-anonimity dataframe
+
+We are not making a difference between diag_type, therefore treating both diagnosis as equally sensible regardless of whether they are primary or secondary.
+
+```{r}
+demog_comp_phi <- merge(x=stay_events_phi%>%select(patient_id, hosp_stay_id, hosp_adm_date, hosp_mortality_bin),
+                        y=demog_phi%>%select(patient_id,birth_date,sex,nation_ref),by="patient_id")
+
+demog_comp_phi <- merge(x=demog_comp_phi,
+                        y=diag_events_phi%>%select(hosp_stay_id,icd,diag_type,reg_date), by="hosp_stay_id")
+
+demog_comp_phi$age<-round(as.numeric(difftime(demog_comp_phi$hosp_adm_date, demog_comp_phi$birth_date, unit="weeks"))/52.25,0)
+
+# we create the 'line' column as an anchor, we will later be able to retrieve actual age, nation and info about the icd before lines were kanonimized
+demog_comp_phi%<>%mutate(line=row_number())
+
+demog_comp_phi%<>%select(hosp_stay_id, hosp_mortality_bin, sex, nation_ref, icd, age,diag_type,reg_date, line)
+demog_comp_phi<-unique(demog_comp_phi)
+```
+
+
+# Calculating k_anonymity
+
+It is important to consider the balance between the risk of reidentification and the clinical usefulness of the data. In the case of our database, which includes 57639 combinations of age, sex, and ICD, we have determined that a k-anonymity threshold of 2 is appropriate. This is because it strikes a balance between the risk of reidentification and the clinical usefulness of the data for research purposes.
+
+In order to further reduce the risk of reidentification, we have implemented a risk-based iterative deidentification strategy that takes into account the likelihood of different types of adversaries attempting to reidentify patients in the database. This includes considering the risk of reidentification in the event that the database is made completely public, as well as the likelihood of different types of adversaries having access to the data and attempting to reidentify patients.
+
+First, we will consider the "friendly researcher," who may accidentally reidentify an acquaintance in the dataset. To mitigate this risk, we will use statistical principles such as k-anonymity and l-diversity to ensure that individuals cannot be distinguished from at least k-1 other individuals in the database, and that there are at least l distinct values for a sensitive attribute within a group of persons with k-anonymity.
+
+Next, we will consider the "rogue researcher," who may deliberately attempt to reidentify individuals using public information. To mitigate this risk, we will use contractual and governance processes such as an end-user license agreement and training on scientific integrity to ensure that researchers use the data ethically and responsibly.
+
+Finally, we will consider the "rogue insurance company," who may illegally attempt to reidentify individuals using corporate data. To mitigate this risk, we will implement an access protocol for source data, an opt-out procedure, and education and delegation logs to further protect patient privacy.
+
+Overall, our approach to deidentifying the data will consider the risk of reidentification by different types of adversaries and implement measures to ensure that the data is safe and clinically useful for research purposes. We will use statistical principles such as k-anonymity and l-diversity to protect the privacy of individuals in the dataset, while also implementing processes such as end-user license agreements and training on scientific integrity to ensure ethical use of the data. In addition, we will implement access protocols, opt-out procedures, and education and delegation logs to further protect patient privacy and mitigate the risk of reidentification by rogue actors.
+
+In order to maintain the clinical usefulness of the data, we have also implemented processes such as an end-user license agreement and training on scientific integrity to ensure that the data is used ethically and responsibly. In addition, we have implemented an access protocol for source data, an opt-out procedure, and education and delegation logs to further protect patient privacy. Overall, our approach to deidentifying the data is designed to ensure that the data is both safe and clinically useful for research purposes.
+
+```{r}
+# Define the desired k-anonymity level
+kanom_level <- 2
+
+# define k anom columns that define a group
+kanon_cols <- c("age", "sex", "hosp_mortality_bin", "icd")
+
+# define unique identifier of each unit of analysis to calculate how many instances of this unique of this id do we have per group
+unique_idfr<-"hosp_stay_id"
+
+# Calculate the k-anonymity of each row
+demog_comp_phi_extended <- demog_comp_phi %>%
+  group_by(.dots = kanon_cols) %>% 
+  mutate(k_anon = length(unique(!!sym(unique_idfr))))
+
+nrow(demog_comp_phi_extended)
+```
+
+# Creating k-anonimity groups
+
+```{r}
+# Filter the data frame to select rows with k-anonymity greater than or equal to the desired level, this patients are safe enough and no further action needs to be taken
+demog_comp_phi_safe <- demog_comp_phi_extended %>%
+  filter(k_anon >= kanom_level)
+
+# Filter the data frame to select rows with k-anonymity below the threshold
+demog_comp_phi_risky <- demog_comp_phi_extended %>%
+  filter(k_anon < kanom_level)
+
+nrow(demog_comp_phi_safe)
+nrow(demog_comp_phi_risky)
+```
+
+After this initial anonimization adress we end up with two datasets
+
+- demog_comp_phi_safe : no further action required, data is safe.
+- demog_comp_phi_risky : on this dataset we will apply a suppression approach by removing first age chararacters and for those not reaching enough k_anom threshold, we will continue removing ICD characters until desired threshold is reached.
+
+# Increasing k-anonimity
+
+## 1) Age Generalization
+
+Removing digits from the age column may be a more clinically useful and effective way to increase the k-anonymity of a dataset when the threshold is 2.
+  
+Removing digits from the age column is a form of generalization, which is a technique used to increase the k-anonymity of a dataset. Generalization involves reducing the level of detail in a dataset by replacing specific values with more general ones. In this case, removing digits from the age column is a way to generalize the age values in the dataset, reducing the level of detail and increasing the k-anonymity.
+
+In contrast, replacing characters in the ICD codes is a form of suppression, which involves removing or obscuring specific values in a dataset. Suppression is generally considered a less preferable option for increasing the k-anonymity of a dataset, as it results in a greater loss of information and may affect the clinical usefulness of the data.
+
+Overall, removing digits from the age column is a more clinically useful and effective way to increase the k-anonymity of a dataset when the threshold is 2. By using generalization rather than suppression, we can maintain a higher level of detail in the dataset while still ensuring that the k-anonymity threshold is met.
+
+!! TODO eda se elimina siempre de todo el paciente.
+
+```{r}
+# Cast age column to character
+demog_comp_phi_risky_forage_general <- demog_comp_phi_risky
+
+
+# Cast age column to character
+demog_comp_phi_risky_forage_general <- demog_comp_phi_risky_forage_general %>%
+  mutate(age = as.character(age))
+
+# Remove k_anon column
+demog_comp_phi_risky_forage_general <- demog_comp_phi_risky_forage_general %>%
+  select(-k_anon)
+
+# Remove one digit from the age column for rows with more than one digit
+demog_comp_phi_risky_forage_general <- demog_comp_phi_risky_forage_general %>%
+  mutate(age = if_else(nchar(age) > 1, paste0(substr(age, 1, nchar(age) - 1), "*"), age))
+
+# Calculate the new k-anonymity of each row
+demog_comp_phi_risky_forage_general <- demog_comp_phi_risky_forage_general %>%
+  group_by(.dots = kanon_cols) %>% 
+  mutate(k_anon = length(unique(!!sym(unique_idfr))))
+
+# Filter the data frame to select rows with k-anonymity greater than or equal to the desired level, this patients are safe enough and no further action needs to be taken
+demog_comp_phi_safe_age <- demog_comp_phi_risky_forage_general %>%
+  filter(k_anon >= kanom_level)
+
+# "age" column in  "demog_comp_phi_risky_forage_general" is restored when k_anon < kanom_level since after removing one digit  the kanom level is still not safed enough
+
+# We Filter rows with k_anon < kanom_level (marked as risky) and select only necessary columns
+demog_comp_phi_risky_age <- demog_comp_phi_risky_forage_general %>%
+  filter(k_anon < kanom_level)
+
+#create a df only with unique hospid and ages, then join by hosp adm
+uniquehosp_ages<-unique(demog_comp_phi_risky[,c('line','age')])
+
+demog_comp_phi_risky_age <- demog_comp_phi_risky_age %>%
+  inner_join(uniquehosp_ages, by = c("line")) %>%
+  select(hosp_stay_id,hosp_mortality_bin,sex,age.y,icd,k_anon,line) %>%
+  rename("age" = "age.y")
+
+# checksum of rows 
+nrow(demog_comp_phi_risky_forage_general)
+nrow(demog_comp_phi_safe_age)
+nrow(demog_comp_phi_risky_age)
+nrow(demog_comp_phi_safe_age)+nrow(demog_comp_phi_risky_age)
+```
+
+After this initial anonymization approach we end up with two datasets:
+
+- demog_comp_phi_safe_age : no further action required, data is safe.
+- demog_comp_phi_risky_age : on this dataset we will apply a suppression approach by removing ICD characters until desired threshold is reached.
+
+## 2) ICD Chars Suppression
+
+### ICD A: 1 Character removal
+
+After we remove 1 digit from the age, for those patients who didn't rease a satisfying k-anonimity level just by removing 1 digit from their age, we continue removing characters from the ICD codes and we repeat this process until the k-anonymity of all rows is above the threshold, using a loop.
+
+The following code will remove one character from the right of each ICD code, calculate the new k-anonymity of each row using the kanon_cols variables, and repeat this process until all rows have a k-anonymity above the threshold defined by the kanom_level variable.
+
+ICD needs to have at least 3 characters, we cannot remove anything else from there, otherwise we canot map it to any description.
+
+```{r}
+# Remove one digit from the age column for rows with more than one digit
+demog_comp_phi_risky_age_foricdA <- demog_comp_phi_risky_age %>%
+   mutate(icd = ifelse(nchar(icd) > 3, paste0(substr(icd, 1, nchar(icd) - 1), ""), icd))
+
+# Calculate the new k-anonymity of each row
+demog_comp_phi_risky_age_foricdA <- demog_comp_phi_risky_age_foricdA %>%
+  group_by(.dots = kanon_cols) %>% 
+  mutate(k_anon = length(unique(!!sym(unique_idfr))))
+
+# Filter the data frame to select rows with k-anonymity greater than or equal to the desired level, this patients are safe enough and no further action needs to be taken
+demog_comp_phi_safe_icdA <- demog_comp_phi_risky_age_foricdA %>%
+  filter(k_anon >= kanom_level)
+
+# Filter the data frame to select rows with k-anonymity smaller than the desired level
+demog_comp_phi_risky_icdA <- demog_comp_phi_risky_age_foricdA %>%
+  filter(k_anon < kanom_level)
+
+# checksum of rows 
+nrow(demog_comp_phi_risky_age)
+nrow(demog_comp_phi_safe_icdA)
+nrow(demog_comp_phi_risky_icdA)
+nrow(demog_comp_phi_safe_icdA)+
+nrow(demog_comp_phi_risky_icdA)
+```
+
+After this initial anonymization approach we end up with two datasets:
+
+- demog_comp_phi_safe_icdA : no further action required, data is safe.
+- demog_comp_phi_risky_icdA : on this dataset we will apply a suppression approach by removing ICD characters until desired threshold is reached.
+
+### ICD B: 2 Characters removal
+
+```{r}
+# Remove one digit from the icd column for rows with more than one digit without counting other '*'
+demog_comp_phi_risky_icdA_foricdB <- demog_comp_phi_risky_icdA %>%
+   mutate(icd = ifelse(nchar(icd) > 3, paste0(substr(icd, 1, nchar(icd) - 1), ""), icd))
+
+# Calculate the new k-anonymity of each row
+demog_comp_phi_risky_icdA_foricdB <- demog_comp_phi_risky_icdA_foricdB %>%
+  group_by(.dots = kanon_cols) %>% 
+  mutate(k_anon = length(unique(!!sym(unique_idfr))))
+
+# Filter the data frame to select rows with k-anonymity greater than or equal to the desired level, this patients are safe enough and no further action needs to be taken
+demog_comp_phi_safe_icdB <- demog_comp_phi_risky_icdA_foricdB %>%
+  filter(k_anon >= kanom_level)
+
+# Filter the data frame to select rows with k-anonymity smaller than the desired level
+demog_comp_phi_risky_icdB <- demog_comp_phi_risky_icdA_foricdB %>%
+  filter(k_anon < kanom_level)
+
+# checksum of rows 
+nrow(demog_comp_phi_risky_icdA)
+nrow(demog_comp_phi_safe_icdB)
+nrow(demog_comp_phi_risky_icdB)
+nrow(demog_comp_phi_safe_icdB)+
+nrow(demog_comp_phi_risky_icdB)
+```
+
+After this initial anonymization approach we end up with two datasets:
+
+- demog_comp_phi_safe_icdB : no further action required, data is safe.
+- demog_comp_phi_risky_icdB : on this dataset we will apply a suppression approach by removing ICD characters until desired threshold is reached.
+
+### ICD C: 3 Characters removal
+
+```{r}
+# Remove one digit from the icd column for rows with more than one digit without counting other '*'
+demog_comp_phi_risky_icdA_foricdC <- demog_comp_phi_risky_icdB %>%
+   mutate(icd = ifelse(nchar(icd) > 3, paste0(substr(icd, 1, nchar(icd) - 1), ""), icd))
+
+# Calculate the new k-anonymity of each row
+demog_comp_phi_risky_icdA_foricdC <- demog_comp_phi_risky_icdA_foricdC %>%
+  group_by(.dots = kanon_cols) %>% 
+  mutate(k_anon = length(unique(!!sym(unique_idfr))))
+
+# Filter the data frame to select rows with k-anonymity greater than or equal to the desired level, this patients are safe enough and no further action needs to be taken
+demog_comp_phi_safe_icdC <- demog_comp_phi_risky_icdA_foricdC %>%
+  filter(k_anon >= kanom_level)
+
+# Filter the data frame to select rows with k-anonymity smaller than the desired level
+demog_comp_phi_risky_icdC <- demog_comp_phi_risky_icdA_foricdC %>%
+  filter(k_anon < kanom_level)
+
+# checksum of rows 
+nrow(demog_comp_phi_risky_icdB)
+nrow(demog_comp_phi_safe_icdC)
+nrow(demog_comp_phi_risky_icdC)
+nrow(demog_comp_phi_safe_icdC)+
+nrow(demog_comp_phi_risky_icdC)
+```
+
+After this initial anonymization approach we end up with two datasets:
+
+- demog_comp_phi_safe_icdC : no further action required, data is safe.
+- demog_comp_phi_risky_icdC : on this dataset we will apply a suppression approach by generalizing eldery patients age until desired threshold is reached.
+
+## 3) Final attempts of increassion kanom
+
+
+### Elderly age generalization
+
+All patients age>89 have been generalized to 99, the median age of all of them.
+
+```{r}
+nrow(demog_comp_phi_safe_icdC)
+# this shows how 3 characters removal did not improve the kanom level not even for 1 row, therefore, we stick to the previous risky dataset we obtained, this is #demog_comp_phi_risky_icdB
+
+
+# Since this is the last attempt, we totally remove ICD info from the final set of risky rows.
+
+# first we calculate median age
+median_elderly_age<-demog_comp_phi_risky_icdB[demog_comp_phi_risky_icdB$age > 89,'age']
+median_elderly_age<-median(median_elderly_age$age)
+
+demog_comp_phi_final_removal_for_elderly_removal <- demog_comp_phi_risky_icdB %>%
+   mutate(age = if_else(age>89, '>89', as.character(age) ) )
+
+# Calculate the new k-anonymity of each row
+demog_comp_phi_final_removal_for_elderly_removal <- demog_comp_phi_final_removal_for_elderly_removal %>%
+  group_by(.dots = kanon_cols) %>% 
+  mutate(k_anon = length(unique(!!sym(unique_idfr))))
+
+# Filter the data frame to select rows with k-anonymity greater than or equal to the desired level, this patients are safe enough and no further action needs to be taken
+demog_comp_phi_safe_final_removal_for_elderly_removal <- demog_comp_phi_final_removal_for_elderly_removal %>%
+  filter(k_anon >= kanom_level)
+
+# Filter the data frame to select rows with k-anonymity smaller than the desired level
+demog_comp_phi_risky_final_removal_for_elderly_removal <- demog_comp_phi_final_removal_for_elderly_removal %>%
+  filter(k_anon < kanom_level)
+
+# checksum of rows 
+nrow(demog_comp_phi_risky_icdB)
+nrow(demog_comp_phi_safe_final_removal_for_elderly_removal)
+nrow(demog_comp_phi_risky_final_removal_for_elderly_removal)
+nrow(demog_comp_phi_safe_final_removal_for_elderly_removal)+
+nrow(demog_comp_phi_risky_final_removal_for_elderly_removal)
+```
+
+### Total ICD supression
+
+```{r}
+# Since this is the last attempt, we totally remove ICD info from the final set of risky rows.
+
+demog_comp_phi_risky_icdB_for_total_icd_removal <- demog_comp_phi_risky_final_removal_for_elderly_removal %>%
+   mutate(icd = '*' )
+
+# Calculate the new k-anonymity of each row
+demog_comp_phi_risky_icdB_for_total_icd_removal <- demog_comp_phi_risky_icdB_for_total_icd_removal %>%
+  group_by(.dots = kanon_cols) %>% 
+  mutate(k_anon = length(unique(!!sym(unique_idfr))))
+
+# Filter the data frame to select rows with k-anonymity greater than or equal to the desired level, this patients are safe enough and no further action needs to be taken
+demog_comp_phi_safe_final_total_icd_removal <- demog_comp_phi_risky_icdB_for_total_icd_removal %>%
+  filter(k_anon >= kanom_level)
+
+# Filter the data frame to select rows with k-anonymity smaller than the desired level
+demog_comp_phi_risky_final_total_icd_removal <- demog_comp_phi_risky_icdB_for_total_icd_removal %>%
+  filter(k_anon < kanom_level)
+
+# checksum of rows 
+nrow(demog_comp_phi_risky_final_removal_for_elderly_removal)
+nrow(demog_comp_phi_safe_final_total_icd_removal)
+print('After all attempts, this is the number of rows we cannot kanonimize anymore')
+nrow(demog_comp_phi_risky_final_total_icd_removal)
+
+nrow(demog_comp_phi_safe_final_total_icd_removal)+
+nrow(demog_comp_phi_risky_final_total_icd_removal)
+```
+
+# Preparing final dataset
+
+## Union all df containing safe data
+
+```{r}
+# Get a list of all objects in the environment
+objs <- ls()
+
+# Use grep to match the pattern "*safe*" and return the matching object names
+safe_objs <- grep("*safe*", objs, value = TRUE)
+safe_objs
+
+# age needs to be same type across datasets that are going to be unioned
+demog_comp_phi_safe <- demog_comp_phi_safe %>%
+  mutate(age=as.character(age))
+
+demog_comp_phi_safe_age <- demog_comp_phi_safe_age %>%
+  mutate(age=as.character(age))
+
+demog_comp_phi_safe_icdA <- demog_comp_phi_safe_icdA %>%
+  mutate(age=as.character(age))
+
+demog_comp_phi_safe_icdB <- demog_comp_phi_safe_icdB %>%
+  mutate(age=as.character(age))
+
+# this one is empty so we don't need it # demog_comp_phi_safe_icdC <- demog_comp_phi_safe_icdC %>%mutate(age=as.character(age))
+
+demog_comp_phi_safe_final_removal_for_elderly_removal <- demog_comp_phi_safe_final_removal_for_elderly_removal %>%
+  mutate(age=as.character(age))
+
+demog_comp_phi_safe_final_total_icd_removal <- demog_comp_phi_safe_final_total_icd_removal %>%
+  mutate(age=as.character(age))
+
+
+
+# Cbind all safe datasets
+demog_safe_final<-rbind(
+
+demog_comp_phi_safe      %>% select(hosp_stay_id, hosp_mortality_bin, sex, icd, age, line),
+
+demog_comp_phi_safe_age  %>% select(hosp_stay_id, hosp_mortality_bin, sex, icd, age, line),
+
+demog_comp_phi_safe_icdA %>% select(hosp_stay_id, hosp_mortality_bin, sex, icd, age, line),
+
+demog_comp_phi_safe_icdB %>% select(hosp_stay_id, hosp_mortality_bin, sex, icd, age, line),
+# demog_comp_phi_safe_icdC %>% select(patient_ref, episode_ref, age, sex, exitus_bin, reg_date, icd), # this one is empty so we don't need it
+demog_comp_phi_safe_final_removal_for_elderly_removal %>% select(hosp_stay_id, hosp_mortality_bin, sex, icd, age),
+
+demog_comp_phi_safe_final_total_icd_removal %>% select(hosp_stay_id, hosp_mortality_bin, sex, icd, age),
+
+)
+
+# in the final checksum cbind of safe + number of rows we cannot kanonimize any more should add up the initial number of rows
+nrow(demog_safe_final)
+nrow(demog_comp_phi_risky_final_total_icd_removal)
+nrow(demog_safe_final)+nrow(demog_comp_phi_risky_final_total_icd_removal)
+
+# initial dataset
+nrow(demog_comp_phi_extended)
+```
+
+
+# Re-structuring demog_safe_final into p_zero tables
+
+## p_zero_phi.demog
+
+```{r}
+unique_hosp_patient<-unique(stay_events_phi%>%
+  select(patient_id,hosp_stay_id))
+
+unique_hosp_patient%<>%inner_join(demog_comp_phi_extended%>% 
+  ungroup() %>%
+  select(hosp_stay_id, nation_ref), by='hosp_stay_id')
+
+# TOD!?!?! do we actually want to keep 
+demog<-unique(demog_safe_final)%>%
+inner_join(unique_hosp_patient, by='hosp_stay_id')%>% 
+ungroup()%>%
+select(patient_id,sex,nation_ref)
+
+demog<-unique(demog)
+```
+
+## p_zero_phi.stay_events
+
+every group is made by
+patient_id, the dataframe is called unique_hosp_age, it also has a column called age
+in age if whithin any group there is a >89, leave '>89' for the whole group
+otherwise if there is a number followed by '*', leave that number followed by '*'
+
+```{r}
+# when running scripts several times, age and age_new need to be created for the first time, they cannot exist previously, this code prevents this chunk to crash
+columns_to_remove <- c("age", "age_new")
+# Check if columns exist and remove them if true
+if (any(columns_to_remove %in% colnames(stay_events_phi))) {
+  stay_events_phi <- select(stay_events_phi, -one_of(columns_to_remove))
+}
+
+
+
+unique_hosp_age<-unique(demog_safe_final%>% 
+  ungroup()%>%
+  select(hosp_stay_id,age))
+
+unique_hosp_age<-unique_hosp_age%>%
+  left_join(stay_events_phi, by='hosp_stay_id')%>%
+  dplyr::arrange(patient_id,hosp_stay_id,age)%>%
+  ungroup()%>%
+  select(patient_id,hosp_stay_id,age)
+
+# !! we could calculate age of a patient using admission dates even if one adm is deid
+#therefore for those patients deid, we are deidentifying all ages for the whole patient
+# meaning we apply the same age deid criteria for the whole patient
+
+
+# if there are several ages per patient or stay, we take the minimum, if any one is >89, we put them all like that for that patient.
+
+new_age_column <- unique_hosp_age  %>%
+ group_by(patient_id) %>%
+ mutate(age_mod = if(any(age == ">89")) ">89" else 
+                   if(any(grepl("\\*", age))) as.character(min(as.numeric(gsub("\\D+", "", age[grepl("\\*", age)])))) 
+                   else as.character(age))%>%
+  mutate(age_mod = ifelse(nchar(age_mod) == 1, paste0(age_mod, '*'), age_mod))%>%
+  ungroup()%>%
+  select(hosp_stay_id,age_mod)%>%
+  rename(age=age_mod)
+
+# aggregating by hosp_stay_id, so we only get the min
+
+new_age_column<-new_age_column%>%
+  group_by(hosp_stay_id)%>%
+  summarise(age_min=min(age))%>%
+  select(hosp_stay_id,age_min)%>%
+  rename(age=age_min)
+
+stay_events_phi<-stay_events_phi%>%
+  left_join(new_age_column, by='hosp_stay_id')
+
+# Replace "*" with "5" in the age column
+stay_events_phi$age_new <- gsub("\\*", "5", stay_events_phi$age)
+```
+
+## p_zero_phi.diag_events
+
+```{r}
+final_hosp_stay_icd<-unique(demog_safe_final%>%
+  ungroup()%>%
+  select(hosp_stay_id,icd,line))  
+
+diag_events<-final_hosp_stay_icd%>%
+  inner_join(demog_comp_phi%>%select(diag_type,reg_date,line), by = 'line')%>%
+  select(hosp_stay_id, icd, diag_type, reg_date)
+
+# QC of ICD chars supression
+
+# Define df and col at the beginning
+df <- diag_events
+col <- "icd"
+
+# Calculate the mean, median, and IQR of the number of characters in col
+print(data.frame(mean = mean(nchar(df[[col]])), median = median(nchar(df[[col]])), IQR = IQR(nchar(df[[col]]))))
+
+df <- diag_events_phi
+col <- "icd"
+
+# Calculate the mean, median, and IQR of the number of characters in col
+print(data.frame(mean = mean(nchar(df[[col]])), median = median(nchar(df[[col]])), IQR = IQR(nchar(df[[col]]))))
+```
+
+
+## De-identify
+
+!!TODO Create proper deided ids!
+!! TODO join needs to be done by hosp adm id, it needs to be properly named.
+!! TODO deid doesn't make sense anymore since patient_ref were changed
+
+```{r}
+demog_final_deid <- demog_final %>%
+  left_join(deid_keys, by = "patient_ref")%>% # !! join by proved hosp adm id when available
+  mutate(reg_date_deid = reg_date + weeks(week_multiples))%>%
+  select(patient_deid,hosp_adm_deid,age,sex,exitus_bin,reg_date_deid,icd) # !!sele t proper deid id when available
+  
+```
+
+
+# Inserting safe table in the database
+
+```{r}
+'
+DROP TABLE IF EXISTS 
+CREATE TABLE p_zero.demog
+AS 
+SELECT
+patient_deid,
+
+'
+```
+
+
